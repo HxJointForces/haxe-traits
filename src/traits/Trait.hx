@@ -1,6 +1,6 @@
 package traits;
 
-import haxe.ds.StringMap.StringMap;
+import haxe.macro.ComplexTypeTools;
 import haxe.macro.ExprTools;
 import haxe.macro.Type;
 import haxe.macro.Context;
@@ -8,12 +8,14 @@ import haxe.macro.Expr;
 import haxe.macro.TypeTools;
 
 using Lambda;
-using haxe.macro.Tools;
 
-private typedef FieldsMap = Map<String,Field>;
-private typedef TraitsMap = Map<String,FieldsMap>;
+private typedef FieldsMap    = Map<String,Field>;
+private typedef TraitFields  = {self:FieldsMap,additional:Array<Field>};
+private typedef TraitsMap    = Map<String,TraitFields>;
+private typedef ClassRef     = {module:String, name:String};
+private typedef InterfaceRef = {t:Ref<ClassType>, params:Array<Type>};
 
-typedef ClassRef = {module:String, name:String}
+
 /**
 * Всякие разные утилиты для кодогенерации
 *
@@ -69,6 +71,25 @@ class Trait {
     }//function parent()
 
 
+    /**
+    * Trace ExprDef of this expression
+    *
+    */
+    @:noCompletion macro static public function showExpr (e:Expr) : Expr {
+        trace(e.expr);
+        return e;
+    }//function showExpr()
+
+
+    /**
+    * Return classpath for cls
+    *
+    */
+    static public inline function classpath (cls:ClassRef) : String {
+        return (cls.module.length > 0 ? cls.module + "." : "") + cls.name;
+    }//function classpath()
+
+
 #if macro
     //traits fields
     static private var _fields : TraitsMap;
@@ -116,101 +137,65 @@ class Trait {
     *
     */
     static private inline function _save (cls:ClassRef, fields:Array<Field>) : Void {
-        fields = Trait._fixTypes(fields);
+        var fixed   : Array<Field> = [];
+        var pFields : Array<Field> = [];
+
+        for(f in fields){
+            f = Trait._copyField(f);
+            switch(f.kind){
+                //method
+                case FFun(fn):
+                    //replace imported types with full types {
+                        //function body
+                        fn.expr = FixTools.fixExpr(fn.expr);
+                        //arguments
+                        for (a in fn.args) a.type = FixTools.fixComplexType(a.type);
+                        //type parameters
+                        for(i in 0...fn.params.length){
+                            FixTools.fixTypeParam(fn.params[i]);
+                        }
+                        //function type
+                        fn.ret = FixTools.fixComplexType(fn.ret);
+                    //}
+
+                    #if !display
+                        //create field for "Trait.parent()" calls
+                        var pField : Field = Trait._copyField(f);
+                        pField.name = Trait._getParentFieldName(cls, pField.name);
+                        pField.access.remove(AOverride);
+                        pFields.push(pField);
+                    #end
+                //variables
+                case FVar(t,e):
+                    f.kind = FVar(FixTools.fixComplexType(t), FixTools.fixExpr(e));
+                //properties
+                case FProp(get,set,t,e):
+                    f.kind = FProp(get, set, FixTools.fixComplexType(t), FixTools.fixExpr(e));
+            }//switch(kind)
+            fixed.push(f);
+        }
+
         //save trait's fields map
-        Trait.__fields().set(cls.module + "." + cls.name, _fieldsMap(fields));
+        Trait.__fields().set(Trait.classpath(cls), {self:_fieldsMap(fixed),additional:pFields});
     }//function _save()
+
+
+    /**
+    * Generate field name to use in "Trait.parent()" calls
+    *
+    */
+    static private inline function _getParentFieldName (cls:ClassRef, fieldName:String) : String {
+        return "__" + StringTools.replace(Trait.classpath(cls), ".", "_") + "_" + fieldName;
+    }//function _getParentFieldName()
 
 
     /**
     * Get trait fields map
     *
     */
-    static private inline function _get (cls:ClassRef) : FieldsMap {
-        return __fields().get(cls.module + "." + cls.name);
+    static private inline function _get (cls:ClassRef) : TraitFields {
+        return __fields().get(Trait.classpath(cls));
     }//function _get()
-
-
-    /**
-    * Insert full classnames instead of imported shortened (by imports) names
-    *
-    */
-    static private function _fixTypes (fields:Array<Field>) : Array<Field> {
-        var fixed : Array<Field> = [];
-
-        for(f in fields){
-            f = Trait._copyField(f);
-            //in bodies of functions replace shortened types
-            switch(f.kind){
-                //method
-                case FFun(f): 
-					
-					f.expr = ExprTools.map(f.expr, Trait._fixExpr);
-				
-					for (a in f.args) a.type = _fixComplexType(a.type);
-					Trait._fixTypeParams(f.params);
-					Trait._fixComplexType(f.ret);
-                
-				
-				case FVar(t, e):
-					f.kind = FVar(Trait._fixComplexType(t), e);
-					
-				case FProp(get, set, t, e):
-					f.kind = FProp(get, set, Trait._fixComplexType(t), e);
-            }//switch(kind)
-            fixed.push(f);
-        }
-
-        return fixed;
-    }//function _fixTypes()
-
-	static function _fixComplexType(ct:ComplexType):ComplexType {
-		return if (ct == null)
-				null;
-			else {
-				var type = null;
-				try { 
-					type = ct.toType();
-				} catch (e:Dynamic) {}
-				type == null ? null : TypeTools.toComplexType(type);
-			}
-	}
-	
-	static function _fixTypeParams(params:Array<TypeParamDecl>) {
-		for (p in params) {
-			for (i in 0...p.constraints.length)
-				p.constraints[i] = Trait._fixComplexType(p.constraints[i]);
-			_fixTypeParams(p.params);
-		}
-	}
-
-    /**
-    * Build traits / add trait fields to classes
-    *
-    */
-    macro static public function build() : Array<Field> {
-        var pos    = Context.currentPos();
-        var cls    = Context.getLocalClass().get();
-        var fields = Context.getBuildFields();
-
-        //trait
-        if( cls.isInterface ){
-            fields = _processTrait(cls, fields);
-
-        //trait descendant
-        }else{
-
-            //to prevent processing one class several times
-            if( _processed.exists(cls.module + "." + cls.name) ){
-                return fields;
-            }
-            _processed.set(cls.module + "." + cls.name, true);
-
-            fields = _processDescendant(cls, [for (i in cls.interfaces) i.t], fields);
-        }
-
-        return fields;
-    }//function build()
 
 
     /**
@@ -220,7 +205,7 @@ class Trait {
     static private function _processTrait (cls:ClassRef, fields:Array<Field>) : Array<Field> {
         _save(cls, fields);
         var _fields : Array<Field> = [];
-		fields = _get(cls).array();
+
         for(f in fields){
             var field : Field = _copyField(f);
 
@@ -237,13 +222,6 @@ class Trait {
                     field.access.remove(AOverride);
                     field.access.remove(AInline);
 
-                    #if !display
-                        //create field for ".parent" calls
-                        var pField : Field = _copyField(f);
-                        pField.name = "_" + StringTools.replace(Context.getLocalClass().toString(), ".", "_") + "_" + pField.name;
-                        pField.access.remove(AOverride);
-                        _get(cls).set(pField.name, pField);
-                    #end
                 //var
                 case FVar(t,e):
                     field.kind = FVar(t,null);
@@ -263,25 +241,25 @@ class Trait {
     * Process trait descendant
     *
     */
-    static private function _processDescendant (cls:ClassRef, interfaces:Array<Ref<ClassType>>, fields:Array<Field>) : Array<Field> {
+    static private function _processDescendant (cls:ClassRef, interfaces:Array<InterfaceRef>, fields:Array<Field>) : Array<Field> {
         //descendant fields map
         var dfm : FieldsMap = _fieldsMap(fields);
         //trait fields map
-        var tfm : FieldsMap;
+        var tfm : TraitFields;
         //source field structure
         var dfield : Field;
         //trait field structure
         var tfield : Field;
 
         for(trait in interfaces){
-            tfm = _get(trait.get());
+            tfm = _get(trait.t.get());
 
             //need to add trait fields
             if( tfm != null ){
-
-                for(fname in tfm.keys()){
+                //real fields
+                for(fname in tfm.self.keys()){
                     dfield = dfm.get(fname);
-                    tfield = tfm.get(fname);
+                    tfield = tfm.self.get(fname);
                     //if descendant does not have such field, copy trait field
                     if( dfield == null ){
                         switch(tfield.kind){
@@ -298,11 +276,16 @@ class Trait {
                     }else{
                         //Check compatibility
                         if( !_fieldsMatch(dfield, tfield) ){
-                            Context.error(cls.name + "." + dfield.name + " type does not match " + trait + "." + tfield.name, Context.currentPos());
+                            Context.error(cls.name + "." + dfield.name + " type does not match " + trait.t.toString() + "." + tfield.name, Context.currentPos());
                         }
-                        _handleParentCalls(trait, dfield);
+                        _handleParentCalls(cls, trait.t, dfield);
                     }
                 }//for()
+
+                //additional generated fields
+                for(tfield in tfm.additional){
+                    fields.push(tfield);
+                }
 
             }//if( tfm != null )
         }//for(interfaces)
@@ -356,90 +339,7 @@ class Trait {
     }//function _copyFunction()
 
 
-    /**
-    * Replace short types with full types
-    *
-    */
-    static private function _fixExpr (expr:Expr) : Expr {
-        switch(expr.expr){
-            //found identifier
-            case EConst(CIdent(ident)):
-                var type : BaseType = Trait._resolveType(ident);
-                if ( type != null ) {
-                    return Context.parse(getHaxePath(type), expr.pos);
-                }
-
-            //new object creation
-            case ENew(t, params):
-                var type : Type = Trait._getType(t.name);
-                if ( type != null ) {
-					var ct:ComplexType = type.toComplexType();
-					switch (ct) {
-						case TPath(p): return {expr : ENew(p, params), pos: expr.pos};
-						case _:
-					}
-                }
-				return expr;
-				
-			case EVars(vars):
-				
-				for (v in vars) v.type = Trait._fixComplexType(v.type);
-				
-			case ECheckType(e, t):
-				
-				e = ExprTools.map(e, Trait._fixExpr);
-				return { expr:ECheckType(e, Trait._fixComplexType(t)), pos:expr.pos };
-				
-			case ECast(e, t):
-				
-				e = ExprTools.map(e, Trait._fixExpr);
-				return { expr:ECast(e, Trait._fixComplexType(t)), pos:expr.pos };
-				
-			case ETry(e, catches):
-				
-				for (c in catches) c.type = Trait._fixComplexType(c.type);
-            
-            case _:
-        }
-		//other expressions
-        return ExprTools.map(expr, Trait._fixExpr);
-    }//function _fixExpr()
-
-	inline static private function getHaxePath(base:BaseType):String {
-		return if (base.module.length > 0)
-				base.module + "." + base.name;
-			else base.name;
-	}
-
-	static private function _getType(type:String) : Type {
-		var t : Type = null;
-		try{
-			t = Context.getType(type);
-		}catch (e:Dynamic) { }
-		return t;
-	}
-	
-	static private function _getBaseType(type:Type):BaseType {
-		return switch(type){
-            case TMono(t): if (t != null) Trait._getBaseType(t.get()); else null;
-			case TEnum(t, _): t.get();
-			case TInst(t, _): t.get();
-			case TType(t, _): t.get();
-			case TAbstract(t,_): t.get();
-            case _: null;
-        }
-	}
-    /**
-    * Get expression with full class path for specified identifier
-    *
-    */
-    inline static private function _resolveType (type:String) : BaseType {
-		var type:Type = Trait._getType(type);
-		return if (type != null) _getBaseType(type); else null;
-    }//function _resolveType()*/
-
-
-    /** the trait, whis is being processed right now */
+    /** the trait, which is being processed right now */
     static private var _trait : Ref<ClassType>;
 
     /**
@@ -447,7 +347,7 @@ class Trait {
     * calls to emulate `super.someMethod` behavior
     *
     */
-    static private function _handleParentCalls (trait:Ref<ClassType>, field:Field) : Void {
+    static private function _handleParentCalls (cls:ClassRef, trait:Ref<ClassType>, field:Field) : Void {
         #if display
             return;
         #end
@@ -470,10 +370,13 @@ class Trait {
         switch(expr.expr){
             case ECall({expr:EField(e,f),pos:pos},p):
                 if( _isParentCall(e) ){
-                    var superField : String = "_" + StringTools.replace(_trait.toString(), ".", "_") + "_";
+                    var superField : String = "__" + StringTools.replace(Trait.classpath(_trait.get()), ".", "_") + "_";
                     return {
                         expr:ECall({
-                            expr:EField({expr:EConst(CIdent("this")), pos:pos}, superField + f),
+                            expr:EField(
+                                {expr:EConst(CIdent("this")), pos:pos},
+                                Trait._getParentFieldName(_trait.get(), f)
+                            ),
                             pos : pos
                         },
                         p),
